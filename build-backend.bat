@@ -1,8 +1,10 @@
 @echo off
 setlocal
+
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
-  echo Visual Studio 2022 or Build Tools with Desktop development with C++ is required.
+  echo Visual Studio with Desktop development with C++ is required.
   pause
   exit /b 1
 )
@@ -18,8 +20,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-copy /y "%~dp0bin\ResurrectedOfflineBots.dll" "%~dp0ResurrectedOfflineBots.dll" >nul
+
 echo.
-echo Built: %~dp0ResurrectedOfflineBots.dll
-echo Keep it beside ResurrectedOfflineBots.exe.
+echo Built: %~dp0bin\ResurrectedOfflineBots.dll
 pause

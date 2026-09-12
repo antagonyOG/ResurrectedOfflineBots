@@ -1,58 +1,50 @@
-# Building ResurrectedOfflineBots
+# Building the V2 Sandbox Lite Source
 
-These instructions reproduce the two compiled components used by the mod: the C++ backend DLL and the Go launcher EXE.
+## Prerequisites
+- Visual Studio 2022 (or Build Tools) with C++ and MSBuild
+- Windows 64-bit target
 
-## Requirements
+## 1) Build backend DLL (AI core)
 
-### Backend DLL
+From this package root:
 
-- Windows 10 or Windows 11
-- Visual Studio 2022 or Visual Studio 2022 Build Tools
-- **Desktop development with C++** workload
-- Windows 10/11 SDK
-- MSVC v143 x64 toolset
+```powershell
+msbuild backend\ResurrectedOfflineBots.vcxproj /m /p:Configuration=Release /p:Platform=x64
+```
 
-### Launcher EXE
+Output:
+- `backend\bin\ResurrectedOfflineBots.dll`
 
-- Go installed for Windows
-- No third-party Go packages are required; the launcher uses the standard library only.
+You can also use:
 
-## Build the backend DLL
+```powershell
+.\build-backend.bat
+```
 
-From the repository root:
+## 2) Build Lite launcher
 
-1. Run `build-backend.bat`.
-2. The script locates MSBuild through `vswhere.exe`.
-3. It builds `ResurrectedOfflineBots.sln` as **Release | x64**.
-4. The compiled DLL is produced under `bin\ResurrectedOfflineBots.dll` and copied to the repository root as `ResurrectedOfflineBots.dll`.
+From this package root:
 
-Equivalent Visual Studio steps:
+```powershell
+msbuild lite-launcher\LiteLauncher.vcxproj /m /p:Configuration=Release /p:Platform=x64
+```
 
-1. Open `ResurrectedOfflineBots.sln` in Visual Studio 2022.
-2. Select **Release** and **x64**.
-3. Build the solution.
+Output:
+- `lite-launcher\bin\ResurrectedOfflineBots.exe`
 
-## Build the launcher EXE
+You can also use:
 
-From the repository root:
+```powershell
+.\build-launcher.bat
+```
 
-1. Run `build-launcher.bat`.
-2. The script sets `GOOS=windows`, `GOARCH=amd64`, and `CGO_ENABLED=0`.
-3. It builds `launcher\main.go` into `ResurrectedOfflineBots.exe`.
+That script builds the current C++ Lite launcher in `lite-launcher\LiteLauncher.vcxproj` and copies `ResurrectedOfflineBots.exe` to the package root.
 
-Equivalent command from the repository root:
+## 3) Run-test flow
 
-    cd launcher
-    set GOOS=windows
-    set GOARCH=amd64
-    set CGO_ENABLED=0
-    go build -trimpath -ldflags="-s -w" -o ..\ResurrectedOfflineBots.exe main.go
-
-## Runtime layout
-
-After both builds, keep these two files together:
-
-    ResurrectedOfflineBots.exe
-    ResurrectedOfflineBots.dll
-
-Then fully load **Offline Play -> Sandbox** in Friday the 13th: Resurrected before starting the EXE.
+1. Copy `backend\bin\ResurrectedOfflineBots.dll` next to `ResurrectedOfflineBots.exe`/launcher executable.
+2. Start game → Offline Play → Sandbox.
+3. Load map, then launch `ResurrectedOfflineBots.exe` from Lite launcher / CLI.
+4. In-game hotkeys:
+   - **F1**: spawn AI Jason
+   - **F3**: spawn one AI counselor (up to 6 total AI counselors in Sandbox)
