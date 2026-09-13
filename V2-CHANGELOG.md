@@ -14,6 +14,8 @@
 - Throwing-knife helper/pickup behavior kept in AI route and non-blocking scan cadence.
 
 ### Fixed
+- Jason throwing knives now use the stock `SERVER_Use` launch path, so the
+  projectile travels toward its counselor target instead of spinning in place.
 - Sequential Sandbox run/reattach behavior so AI can be requested again after a match ends.
 - Death/kill-state cleanup to avoid stale AI interaction states on match restart.
 - Reduced stale combat/freeze states by resetting counselor/kill team registries between phases.

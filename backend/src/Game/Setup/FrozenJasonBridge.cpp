@@ -1,6 +1,14 @@
 // Compile the frozen implementation through a narrow adapter translation unit.
 // Do not edit Features.cpp: its authoritative hash is verified by the package.
 #include <cstdint>
+class AActor;
+class UObject;
+#ifdef ROB_LITE_SANDBOX
+namespace FrozenJasonBridge
+{
+    bool AdoptCounselorModeJason(AActor*, UObject*, AActor*);
+}
+#endif
 extern "C" __declspec(noinline) bool SafeProcessEventCall(
     uintptr_t vptr,
     void* obj,
@@ -375,7 +383,6 @@ namespace
     static ULONGLONG g_KillTeamFinalInteractionStartedAt = 0;
     static ULONGLONG g_KillTeamFinalSequenceStartedAt = 0;
     static bool g_KillTeamFinalInteractionCommitted = false;
-    static ULONGLONG g_FinalKillCompletionDeadline = 0;
     static ULONGLONG g_KillTeamFinalRecoveryCooldownUntil = 0;
     static int32_t g_KillTeamFinalMoveFailures = 0;
     static bool g_KillTeamFinalRepositionAttempted = false;
@@ -5990,69 +5997,6 @@ namespace
 
     }
 
-    bool RequestCounselorRouteMatchCompletionAfterJasonDeath()
-    {
-        UWorld* world = g_JasonAIState.World;
-        if (!world ||
-            !Memory::IsReadable(world, sizeof(UWorld)))
-        {
-            return false;
-        }
-
-        UObject* gameMode = reinterpret_cast<UObject*>(ReadActorField(
-            reinterpret_cast<UObject*>(world),
-            0xF0));
-        UObject* gameState = reinterpret_cast<UObject*>(ReadActorField(
-            reinterpret_cast<UObject*>(world),
-            0xF8));
-
-        // A dead Jason must not enter the stock walking-home shot.  Arm the
-        // existing native rule on whichever lifecycle owner exposes it, then
-        // let GameMode drive its normal results/menu transition.
-        const bool skippedGameModeOutro = WriteReflectedBoolByte(
-            gameMode,
-            "bSkipLevelOutro",
-            true);
-        const bool skippedGameStateOutro = WriteReflectedBoolByte(
-            gameState,
-            "bSkipLevelOutro",
-            true);
-
-        bool completionDispatched = false;
-        if (gameMode && gameMode->Class &&
-            Memory::IsReadable(gameMode, sizeof(UObject)) &&
-            Memory::IsReadable(gameMode->Class, sizeof(UObject)))
-        {
-            const char* completionFunctions[] = { "EndMatch", "FinishMatch" };
-            for (const char* functionName : completionFunctions)
-            {
-                UFunction* completion = FindFunctionInHierarchyByName(
-                    gameMode->Class,
-                    functionName);
-                if (!completion)
-                    continue;
-
-                alignas(16) uint8_t params[0x40]{};
-                completionDispatched = SafeProcessEventCall(
-                    reinterpret_cast<uintptr_t>(gameMode),
-                    gameMode,
-                    completion,
-                    params);
-                if (completionDispatched)
-                    break;
-            }
-        }
-
-        Logger::Success(
-            std::string("18L-BD final Jason death requested native match completion | dispatched=") +
-            (completionDispatched ? "true" : "false") +
-            " | skipGameModeOutro=" +
-            (skippedGameModeOutro ? "true" : "false") +
-            " | skipGameStateOutro=" +
-            (skippedGameStateOutro ? "true" : "false"));
-        return completionDispatched;
-    }
-
     void DriveCounselorKillTeamAI(ULONGLONG now)
     {
         // Own cadence: remains active for surviving AI counselors even if the
@@ -6066,28 +6010,6 @@ namespace
         if (!IsValidatedLiveCounselorPawn(human))
         {
             g_NextKillTeamTickAt = now + 60000;
-            return;
-        }
-
-        // A consumed JasonDeath context is only a pending completion signal.
-        // Keep this controller wrapper alive until GameMode actually leaves
-        // InProgress.  If that never happens, restore the retryable sweater /
-        // kneel state instead of leaving Jason permanently frozen.
-        if (g_KillTeamFinalInteractionCommitted)
-        {
-            g_NextKillTeamTickAt = now + 250;
-            if (g_FinalKillCompletionDeadline != 0 &&
-                now >= g_FinalKillCompletionDeadline)
-            {
-                g_KillTeamFinalInteractionCommitted = false;
-                g_FinalKillCompletionDeadline = 0;
-                AbortFailedJasonKillSequence(
-                    g_JasonAIState.Jason,
-                    nullptr,
-                    now);
-                Logger::Error(
-                    "18L-BD native match completion timed out; restored Jason kill retry instead of freezing AI");
-            }
             return;
         }
 
@@ -6110,26 +6032,142 @@ namespace
                 reinterpret_cast<UObject*>(g_JasonAIState.Jason),
                 0x12D8)
             : nullptr;
+#ifdef ROB_LITE_SANDBOX
+        const bool liteSandboxFinalFallback =
+            g_KillTeamFinalInteractionAttempts > 0 &&
+            g_KillTeamFinalInteractionStartedAt != 0 &&
+            now - g_KillTeamFinalInteractionStartedAt >= 12000;
+#else
+        const bool liteSandboxFinalFallback = false;
+#endif
         if (!g_KillTeamFinalInteractionCommitted &&
             g_KillTeamFinalInteractionAttempts > 0 &&
             g_KillTeamFinalInteractionStartedAt != 0 &&
             now - g_KillTeamFinalInteractionStartedAt >= 8000 &&
-            !directDeathContext)
+            (!directDeathContext || liteSandboxFinalFallback))
         {
+#ifdef ROB_LITE_SANDBOX
+            StopJasonAIMovementForKnifeOnGameThread();
+            UObject* deadJasonController = g_JasonAIState.Controller;
+            if (deadJasonController && deadJasonController->Class &&
+                Memory::IsReadable(deadJasonController, sizeof(UObject)) &&
+                Memory::IsReadable(deadJasonController->Class, sizeof(UObject)))
+            {
+                UFunction* setTickEnabled = FindFunctionInHierarchyByName(
+                    deadJasonController->Class, "SetActorTickEnabled");
+                if (setTickEnabled)
+                {
+                    struct TickParams { bool bEnabled; } params{};
+                    SafeProcessEventCall(
+                        reinterpret_cast<uintptr_t>(deadJasonController),
+                        deadJasonController, setTickEnabled, &params);
+                }
+            }
+#endif
             g_KillTeamFinalInteractionCommitted = true;
             g_KillTeamFinalInteractionDispatched = true;
             g_KillTeamFinalInteractionPending = false;
             g_KillTeamFinalContextUntil = now + 60000;
-            g_FinalKillCompletionDeadline = now + 60000;
             g_OrphanJasonStunStartedAt = 0;
             g_JasonAIState.Target = nullptr;
+            g_JasonAIState.Active = false;
             ResetVehicleInterceptionState();
             SetJasonHighPriorityPursuitBoost(false, "Jason-final-death");
-            const bool completionDispatched =
-                RequestCounselorRouteMatchCompletionAfterJasonDeath();
+#ifdef ROB_LITE_SANDBOX
+            bool liteMatchEnded = false;
+            AActor* sandboxGameMode = g_JasonAICache.SandboxGameMode;
+            UObject* sandboxGameState = reinterpret_cast<UObject*>(
+                g_JasonAIState.StartupTrapGameState);
+
+            // Sandbox normally enters its Jason "walk home" level outro when
+            // EndMatch succeeds.  A final-killed Jason must bypass that shot
+            // and continue directly into the ordinary end-match UI.  The
+            // stock game exposes bSkipLevelOutro for this exact transition;
+            // resolve it reflectively so this remains map independent.
+            const bool skippedGameModeOutro = WriteReflectedBoolByte(
+                reinterpret_cast<UObject*>(sandboxGameMode),
+                "bSkipLevelOutro",
+                true);
+            const bool skippedGameStateOutro = WriteReflectedBoolByte(
+                sandboxGameState,
+                "bSkipLevelOutro",
+                true);
             Logger::Success(
-                std::string("18L-BD native final kill committed; awaiting verified GameMode completion | dispatched=") +
-                (completionDispatched ? "true" : "false"));
+                std::string("Lite Sandbox final kill: stock level outro skip armed | gameMode=") +
+                (skippedGameModeOutro ? "true" : "false") +
+                " | gameState=" +
+                (skippedGameStateOutro ? "true" : "false"));
+
+            if (sandboxGameMode && sandboxGameMode->Class &&
+                Memory::IsReadable(sandboxGameMode, sizeof(UObject)) &&
+                Memory::IsReadable(sandboxGameMode->Class, sizeof(UObject)))
+            {
+                const char* completionFunctions[] = { "EndMatch", "FinishMatch" };
+                for (const char* functionName : completionFunctions)
+                {
+                    UFunction* completion = FindFunctionInHierarchyByName(
+                        sandboxGameMode->Class, functionName);
+                    if (!completion)
+                        continue;
+                    alignas(16) uint8_t params[0x40]{};
+                    liteMatchEnded = SafeProcessEventCall(
+                        reinterpret_cast<uintptr_t>(sandboxGameMode),
+                        sandboxGameMode, completion, params);
+                    Logger::Success(std::string("Lite Sandbox final kill: ") +
+                        functionName + " dispatched=" +
+                        (liteMatchEnded ? "true" : "false"));
+                    if (liteMatchEnded)
+                        break;
+                }
+            }
+
+            bool resultsShown = false;
+            UObject* resultTargets[4]{};
+            resultTargets[0] = reinterpret_cast<UObject*>(
+                Engine::GetLocalPlayerController());
+            resultTargets[1] = reinterpret_cast<UObject*>(sandboxGameMode);
+            resultTargets[2] = sandboxGameState;
+            if (resultTargets[0] && resultTargets[0]->Class &&
+                Memory::IsReadable(resultTargets[0], sizeof(UObject)))
+            {
+                UFunction* getHUD = FindFunctionInHierarchyByName(
+                    resultTargets[0]->Class, "GetHUD");
+                if (getHUD)
+                {
+                    struct HUDParams { UObject* ReturnValue; } params{};
+                    if (SafeProcessEventCall(
+                            reinterpret_cast<uintptr_t>(resultTargets[0]),
+                            resultTargets[0], getHUD, &params))
+                    {
+                        resultTargets[3] = params.ReturnValue;
+                    }
+                }
+            }
+            for (UObject* target : resultTargets)
+            {
+                if (!target || !target->Class ||
+                    !Memory::IsReadable(target, sizeof(UObject)) ||
+                    !Memory::IsReadable(target->Class, sizeof(UObject)))
+                    continue;
+                UFunction* showMenus = FindFunctionInHierarchyByName(
+                    target->Class, "OnShowEndMatchMenus");
+                if (!showMenus)
+                    continue;
+                alignas(16) uint8_t params[0x40]{};
+                resultsShown = SafeProcessEventCall(
+                    reinterpret_cast<uintptr_t>(target), target,
+                    showMenus, params);
+                if (resultsShown)
+                    break;
+            }
+            Logger::Success(
+                std::string("Lite Sandbox final kill: results UI dispatched=") +
+                (resultsShown ? "true" : "false"));
+            if (!liteMatchEnded)
+                Logger::Error("Lite Sandbox final kill: match completion function unavailable; Jason remains retired");
+#endif
+            Logger::Success(
+                "18L-BD native final kill committed; custom Jason AI retired for stock match completion");
             return;
         }
 
@@ -10977,7 +11015,6 @@ namespace FrozenJasonBridge
         g_KillTeamFinalInteractionStartedAt = 0;
         g_KillTeamFinalSequenceStartedAt = 0;
         g_KillTeamFinalInteractionCommitted = false;
-        g_FinalKillCompletionDeadline = 0;
         g_KillTeamFinalRecoveryCooldownUntil = 0;
         g_KillTeamFinalMoveFailures = 0;
         g_KillTeamFinalRepositionAttempted = false;
@@ -11045,8 +11082,15 @@ namespace FrozenJasonBridge
         RemoveCounselorRouteHunterAxeLoadoutHook();
         RemoveUniversalFinalKillEligibilityHook();
         RemoveUniversalPamelaSweaterPickupHook();
+#ifdef ROB_LITE_SANDBOX
+        JasonAICache liteSandboxCache = g_JasonAICache;
+#endif
         g_JasonAIState = JasonAIState{};
         g_JasonAICache = JasonAICache{};
+#ifdef ROB_LITE_SANDBOX
+        g_JasonAICache = liteSandboxCache;
+        g_JasonAICache.World = world;
+#endif
         ResetJasonAITargets();
         ResetLoadedCounselorClassCache();
 
@@ -11211,7 +11255,6 @@ namespace FrozenJasonBridge
         g_KillTeamFinalInteractionStartedAt = 0;
         g_KillTeamFinalSequenceStartedAt = 0;
         g_KillTeamFinalInteractionCommitted = false;
-        g_FinalKillCompletionDeadline = 0;
         g_KillTeamFinalRecoveryCooldownUntil = 0;
         g_KillTeamFinalMoveFailures = 0;
         g_KillTeamFinalRepositionAttempted = false;

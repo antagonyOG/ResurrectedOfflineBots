@@ -373,6 +373,49 @@ SafeSCThrowableBuildVelocityCall(
 }
 
 
+static __declspec(noinline) bool
+SafeSCThrowableServerUseWrapperCall(
+    uintptr_t wrapperAddress,
+    void* throwable,
+    AActor* jason,
+    const FVector* velocity,
+    const FVector* launchLocation)
+{
+    if (!wrapperAddress ||
+        !throwable ||
+        !jason ||
+        !velocity ||
+        !launchLocation ||
+        !Memory::IsReadable((void*)wrapperAddress, 1))
+    {
+        return false;
+    }
+
+    __try
+    {
+        // Exact Resurrected SCThrowable::Use dispatch observed at
+        // 0x14042FAD9-0x14042FAFF: 0x14040A7B0 prepares velocity/owner,
+        // then 0x1404EE4C0 dispatches SERVER_Use through ProcessEvent.
+        using ServerUseWrapperFn =
+            void(__fastcall*)(
+                void*,
+                AActor*,
+                const FVector*,
+                const FVector*);
+
+        ServerUseWrapperFn fn =
+            (ServerUseWrapperFn)wrapperAddress;
+
+        fn(throwable, jason, velocity, launchLocation);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+
 static bool
 RunOfflineBotsControllerTickOnGameThread();
 
@@ -582,6 +625,11 @@ g_JasonRequestPending{ false };
 
 static std::atomic<bool>
 g_JasonRequestUsed{ false };
+#ifdef ROB_LITE_SANDBOX
+// UWorld can be reused when Sandbox returns to its picker and starts another
+// map. The possessed counselor changes even when the world address does not.
+static AActor* g_LiteSessionLocalPawn = nullptr;
+#endif
 
 // One counselor bot can be queued at a time from the
 // render/input thread and consumed by the existing
@@ -750,6 +798,10 @@ static UClass* g_LoadedCounselorClasses[32]{};
 static bool g_LoadedCounselorClassUsed[32]{};
 static int32_t g_LoadedCounselorClassCount = 0;
 static bool g_LoadedCounselorClassScanDone = false;
+#ifdef ROB_LITE_SANDBOX
+static FVector g_LiteCounselorSpawnPoints[64]{};
+static int32_t g_LiteCounselorSpawnPointCount = 0;
+#endif
 
 static void ResetLoadedCounselorClassCache()
 {
@@ -915,7 +967,7 @@ SafeReadGObjectPointer(
             *(UObject**)
             (objectsPtr +
                 ((uintptr_t)index *
-                    sizeof(uintptr_t)));
+                    0x18));
     }
     __except (
         EXCEPTION_EXECUTE_HANDLER)
@@ -1261,6 +1313,28 @@ FindSafeCounselorSpawnLocation(
     int32_t slot,
     FVector& outLocation)
 {
+#ifdef ROB_LITE_SANDBOX
+    if (g_LiteCounselorSpawnPointCount > 0)
+    {
+        for (int32_t attempt = 0;
+            attempt < g_LiteCounselorSpawnPointCount; ++attempt)
+        {
+            const int32_t index =
+                (slot * 7 + 3 + attempt) % g_LiteCounselorSpawnPointCount;
+            const FVector& authored = g_LiteCounselorSpawnPoints[index];
+            const float dx = authored.X - localLocation.X;
+            const float dy = authored.Y - localLocation.Y;
+            if (dx * dx + dy * dy < 900.0f * 900.0f)
+                continue;
+            outLocation = authored;
+            Logger::Debug(
+                "Lite Sandbox counselor spawn uses direct authored PlayerStart " +
+                std::to_string(index + 1) + "/" +
+                std::to_string(g_LiteCounselorSpawnPointCount));
+            return true;
+        }
+    }
+#endif
     // Shorter ring than the old +/-1200 offsets.  More importantly,
     // projection is deliberately shallow in Z so a cabin roof cannot
     // win over the floor/ground near the player.
@@ -1822,9 +1896,32 @@ static void PrecacheJasonAIResources()
     // New Sandbox/world: reset the cache
     // and allow one fresh AI Jason.
     //
-    if (g_JasonAICache.World != world)
+#ifdef ROB_LITE_SANDBOX
+    const bool reusedWorldNewLiteSession =
+        g_JasonAICache.World == world &&
+        g_JasonRequestPending.load() &&
+        g_JasonRequestUsed.load() &&
+        g_LiteSessionLocalPawn &&
+        controller->AcknowledgedPawn != g_LiteSessionLocalPawn;
+#else
+    const bool reusedWorldNewLiteSession = false;
+#endif
+    if (g_JasonAICache.World != world || reusedWorldNewLiteSession)
     {
+#ifdef ROB_LITE_SANDBOX
+        const bool preservePendingJasonRequest = g_JasonRequestPending.load();
+
+        // The mature counselor-route wrapper owns the same SCKillerAIController
+        // vtable slot as the base OfflineBots hook.  Keep both hook metadata
+        // pointers intact across Sandbox travel so AdoptCounselorModeJason can
+        // restore wrapper -> base hook -> stock Tick in the correct order.
+        // Clearing only the base-hook metadata here stranded the wrapper in
+        // the class vtable and made every Jason after the first one inert.
+        Logger::Debug(
+            "Lite Sandbox session reset: preserving mature Tick hook metadata until adoption");
+#else
         RemoveOfflineBotsControllerTickHook();
+#endif
 
         g_JasonAICache =
             JasonAICache{};
@@ -1832,12 +1929,28 @@ static void PrecacheJasonAIResources()
         g_JasonAICache.World =
             world;
 
+#ifdef ROB_LITE_SANDBOX
+        g_JasonRequestPending.store(preservePendingJasonRequest);
+#else
         g_JasonRequestPending.store(false);
+#endif
         g_JasonRequestUsed.store(false);
         g_CounselorRequestPending.store(false);
         g_CounselorBotsSpawned.store(0);
+#ifdef ROB_LITE_SANDBOX
+        g_LiteSessionLocalPawn = nullptr;
+        if (reusedWorldNewLiteSession)
+            Logger::Success("Lite Sandbox: reused UWorld with a new counselor pawn; session re-armed");
+#endif
         ResetJasonAITargets();
         ResetLoadedCounselorClassCache();
+#ifdef ROB_LITE_SANDBOX
+        // World travel owns this reset. Mature-AI adoption in the same world
+        // also resets the class cache, but must retain these map coordinates.
+        std::memset(g_LiteCounselorSpawnPoints, 0,
+            sizeof(g_LiteCounselorSpawnPoints));
+        g_LiteCounselorSpawnPointCount = 0;
+#endif
 
         g_JasonAIState =
             JasonAIState{};
@@ -1876,6 +1989,7 @@ static void PrecacheJasonAIResources()
     if (!g_JasonAICache.SandboxGameMode ||
         !g_JasonAICache.KillerStart)
     {
+        AActor* firstKillerStart = nullptr;
         for (int32_t levelIndex = 0;
             levelIndex < levels->Count;
             ++levelIndex)
@@ -1935,16 +2049,17 @@ static void PrecacheJasonAIResources()
                     );
 
                 if (!g_JasonAICache.SandboxGameMode &&
-                    className ==
-                    "SCGameMode_Sandbox")
+                    className.find("SCGameMode_Sandbox") != std::string::npos)
                 {
                     g_JasonAICache.SandboxGameMode =
                         actor;
                 }
 
+                if (className.find("SCKillerPlayerStart") != std::string::npos &&
+                    !firstKillerStart)
+                    firstKillerStart = actor;
                 if (!g_JasonAICache.KillerStart &&
-                    className ==
-                    "SCKillerPlayerStart" &&
+                    className.find("SCKillerPlayerStart") != std::string::npos &&
                     actorName.find(
                         "Killer_Start") !=
                     std::string::npos)
@@ -1952,8 +2067,54 @@ static void PrecacheJasonAIResources()
                     g_JasonAICache.KillerStart =
                         actor;
                 }
+#ifdef ROB_LITE_SANDBOX
+                const bool genericPlayerStart =
+                    (className.find("PlayerStart") != std::string::npos ||
+                     actorName.find("PlayerStart") != std::string::npos) &&
+                    className.find("Killer") == std::string::npos &&
+                    actorName.find("Killer") == std::string::npos &&
+                    className.find("Jason") == std::string::npos &&
+                    actorName.find("Jason") == std::string::npos;
+                if (genericPlayerStart && g_LiteCounselorSpawnPointCount < 64)
+                {
+                    void** root = reinterpret_cast<void**>(
+                        reinterpret_cast<uintptr_t>(actor) + Offsets::Actor_RootComponent);
+                    if (Memory::IsReadable(root, sizeof(void*)) && *root)
+                    {
+                        FVector* location = reinterpret_cast<FVector*>(
+                            reinterpret_cast<uintptr_t>(*root) +
+                            Offsets::Scene_ComponentToWorld +
+                            Offsets::FTransform_Translation);
+                        if (Memory::IsReadable(location, sizeof(FVector)) &&
+                            std::isfinite(location->X) &&
+                            std::isfinite(location->Y) &&
+                            std::isfinite(location->Z))
+                        {
+                            bool separated = true;
+                            for (int32_t p = 0; p < g_LiteCounselorSpawnPointCount; ++p)
+                            {
+                                const float dx = location->X - g_LiteCounselorSpawnPoints[p].X;
+                                const float dy = location->Y - g_LiteCounselorSpawnPoints[p].Y;
+                                if (dx * dx + dy * dy < 700.0f * 700.0f)
+                                {
+                                    separated = false;
+                                    break;
+                                }
+                            }
+                            if (separated)
+                                g_LiteCounselorSpawnPoints[g_LiteCounselorSpawnPointCount++] = *location;
+                        }
+                    }
+                }
+#endif
             }
         }
+        if (!g_JasonAICache.KillerStart && firstKillerStart)
+            g_JasonAICache.KillerStart = firstKillerStart;
+#ifdef ROB_LITE_SANDBOX
+        Logger::Debug("Lite Sandbox counselor start cache=" +
+            std::to_string(g_LiteCounselorSpawnPointCount));
+#endif
     }
 
     //
@@ -3887,6 +4048,7 @@ static bool SpawnJasonZombieAIOnGameThread()
         "Jason AI OfflineBots state active"
     );
 
+#ifndef ROB_LITE_SANDBOX
     if (!InstallOfflineBotsControllerTickHook(
         killerController))
     {
@@ -3899,6 +4061,14 @@ static bool SpawnJasonZombieAIOnGameThread()
 
         return false;
     }
+#else
+    // Lite immediately hands this pawn to AdoptCounselorModeJason below.
+    // That routine restores any prior-match wrapper and installs the mature
+    // counselor-route hook exactly once. Installing this temporary hook first
+    // fails on a reused second Sandbox and previously caused a spawn loop.
+    Logger::Debug(
+        "Lite AI direct spawn: temporary controller Tick hook deferred to mature adoption");
+#endif
 
     //
     // Find the live NavigationSystem directly
@@ -4278,6 +4448,15 @@ static bool SpawnJasonZombieAIOnGameThread()
             "Jason AI spawn: local possession changed unexpectedly"
         );
     }
+#ifdef ROB_LITE_SANDBOX
+    if (!FrozenJasonBridge::AdoptCounselorModeJason(
+            spawnParams.ReturnValue, killerController, localPawn))
+    {
+        Logger::Error("Lite AI spawn: full AI route adoption failed");
+        return false;
+    }
+    g_LiteSessionLocalPawn = localPawn;
+#endif
 
     return true;
 }
@@ -7745,12 +7924,8 @@ static bool LaunchJasonAIKnifeProjectileOnGameThread(
     if (!module)
         return false;
 
-    // Features36: the human-Jason baseline finally showed the useful
-    // ordering difference.  A real throw has +0x15F8 already cleared
-    // before ThrowingKnife_C::MULTICAST_Use_Implementation (+0x5F0)
-    // receives the launch vector.  AI Jason has no player camera, so do
-    // not reuse the potentially stale Jason +0x7D0 camera transform.
-    // Launch the already-spawned ThrowingKnife_C from its current hand
+    // Match the stock SCThrowable::Use ordering. AI Jason has no player
+    // camera, so launch the already-spawned ThrowingKnife_C from its hand
     // position and aim its stock 12000-ish velocity at the counselor.
     constexpr uintptr_t Offset_KnifeDriver = 0x10F0;
     constexpr uintptr_t Offset_ThrowSpeed = 0x10E8;
@@ -7944,21 +8119,21 @@ static bool LaunchJasonAIKnifeProjectileOnGameThread(
             &nativeVelocityScratch,
             jason);
 
-    uintptr_t multicastImplementationAddress = 0;
+    constexpr uintptr_t RVA_SCThrowableServerUseWrapper =
+        0x004EE4C0;
 
     bool callOK =
-        SafeSCThrowableMulticastImplementationCall(
+        SafeSCThrowableServerUseWrapperCall(
+            (uintptr_t)module +
+                RVA_SCThrowableServerUseWrapper,
             knifeDriver,
             jason,
             &velocity,
-            &launchLocation,
-            &multicastImplementationAddress
+            &launchLocation
         );
 
-    // Features41 deliberately does not force visibility, activation, tick,
-    // or movement-component state here.  Features39/40 established the
-    // stock montage timing; this helper supplies only the missing local
-    // launch transition using an AI-safe WORLD-SPACE origin.
+    // Keep the stock server/RPC launch transition intact. This helper only
+    // supplies the AI-safe WORLD-SPACE origin and counselor-directed vector.
 
     outThrowSpeed =
         std::sqrt(
@@ -11851,11 +12026,13 @@ OfflineBotsKillerControllerTickHook(
 
 bool Features::QueueFirstJasonSandbox()
 {
+#ifndef ROB_LITE_SANDBOX
     if (g_JasonRequestUsed.load())
     {
         Logger::Debug("Jason request blocked: already used this session");
         return false;
     }
+#endif
 
     bool expected = false;
     if (!g_JasonRequestPending.compare_exchange_strong(expected, true))
@@ -11884,8 +12061,18 @@ bool Features::RequestFirstJasonSandbox()
 bool Features::ConsumeQueuedJasonRequestOnGameThread()
 {
     // Jason request has priority when both keys are pressed together.
+#ifdef ROB_LITE_SANDBOX
+    if (g_JasonRequestPending.load())
+    {
+        PrecacheJasonAIResources();
+        if (!g_JasonAICache.Ready)
+            return false;
+        if (!g_JasonRequestPending.exchange(false))
+            return false;
+#else
     if (g_JasonRequestPending.exchange(false))
     {
+#endif
         if (g_JasonRequestUsed.load())
         {
             Logger::Debug("Jason AI spawn blocked: already used this session");
@@ -11899,6 +12086,10 @@ bool Features::ConsumeQueuedJasonRequestOnGameThread()
         bool result = SpawnJasonZombieAIOnGameThread();
         if (result)
             g_JasonRequestUsed.store(true);
+
+        // Persistence applies only while streamed resources are not ready.
+        // Once an actual spawn attempt begins, consume F1 even on failure so
+        // a bad handoff can never create unbounded duplicate Jasons.
 
         return result;
     }
@@ -11922,5 +12113,12 @@ void Features::TickAIOnly()
 
     // Read/cache only. Actual spawns are always consumed by the game-thread
     // ProcessEvent bridge; Jason AI itself is driven by SCKillerAIController Tick.
+#ifdef ROB_LITE_SANDBOX
+    static ULONGLONG nextLitePrecacheAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < nextLitePrecacheAt)
+        return;
+    nextLitePrecacheAt = now + 250;
+#endif
     PrecacheJasonAIResources();
 }
